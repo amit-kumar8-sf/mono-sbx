@@ -1,0 +1,79 @@
+# SANDBOX producer — stands in for the monorepo's publish.yml for E2E testing only.
+# The file is named publish.yml ON PURPOSE: b2c-dx verifies attestations with
+#   --signer-workflow <owner>/<repo>/.github/workflows/publish.yml
+# so the path must match prod exactly. It builds a DUMMY .vsix (no real extension
+# source), attests it against the public-good Sigstore instance, and creates the
+# release b2c-dx downloads + verifies. This is both the E2E-A probe and the
+# E2E-B producer in one run.
+#
+# Injection-safe: the untrusted workflow_dispatch `version` input is bound to
+# env.VERSION and only ever referenced as the quoted "$VERSION"; it is never
+# interpolated directly into a run: line.
+name: publish
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to release (tag becomes b2c-vs-extension@<version>)'
+        required: true
+        default: '0.10.1'
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build-attest-release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # create the release + tag
+      id-token: write # required for SLSA provenance signing
+      attestations: write # required for actions/attest-build-provenance
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      VERSION: ${{ github.event.inputs.version }}
+    steps:
+      - uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4.3.0
+
+      - name: Build dummy VSIX + compute sha256
+        run: |
+          set -euo pipefail
+          # Constrain the untrusted version input before it touches a filename.
+          echo "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$' \
+            || { echo "::error::version '$VERSION' is not valid semver"; exit 1; }
+          mkdir -p packages/b2c-vs-extension
+          VSIX="packages/b2c-vs-extension/b2c-vs-extension-${VERSION}.vsix"
+          printf 'sandbox dummy VSIX for b2c-vs-extension %s (run %s)\n' "$VERSION" "$GITHUB_RUN_ID" > "$VSIX"
+          SHA=$(sha256sum "$VSIX" | awk '{print $1}')
+          echo "VSIX=$VSIX" >> "$GITHUB_ENV"
+          {
+            echo "### Producer output"
+            echo ""
+            echo "| field | value |"
+            echo "|---|---|"
+            echo "| version | \`$VERSION\` |"
+            echo "| vsix | \`$(basename "$VSIX")\` |"
+            echo "| sha256 | \`$SHA\` |"
+            echo "| tag | \`b2c-vs-extension@${VERSION}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Attest build provenance (SLSA)
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        with:
+          subject-path: packages/b2c-vs-extension/*.vsix
+
+      - name: Create release
+        run: |
+          set -euo pipefail
+          TAG="b2c-vs-extension@${VERSION}"
+          # Re-runnable: replace any existing sandbox release/tag for this version.
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release delete "$TAG" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag
+          fi
+          gh release create "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "b2c-vs-extension ${VERSION}" \
+            --notes "Sandbox test release for W-22108538 end-to-end verification." \
+            "$VSIX"
+          echo "Created release $TAG" >> "$GITHUB_STEP_SUMMARY"
