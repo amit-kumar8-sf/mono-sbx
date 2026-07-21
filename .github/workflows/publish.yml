@@ -1,79 +1,189 @@
-# SANDBOX producer — stands in for the monorepo's publish.yml for E2E testing only.
-# The file is named publish.yml ON PURPOSE: b2c-dx verifies attestations with
-#   --signer-workflow <owner>/<repo>/.github/workflows/publish.yml
-# so the path must match prod exactly. It builds a DUMMY .vsix (no real extension
-# source), attests it against the public-good Sigstore instance, and creates the
-# release b2c-dx downloads + verifies. This is both the E2E-A probe and the
-# E2E-B producer in one run.
+name: Publish
+
+# ┌─────────────────────────────────────────────────────────────────────────┐
+# │ SANDBOX E2E EMITTER — TEST ONLY — DO NOT MERGE TO ANY PRODUCTION REPO.    │
+# └─────────────────────────────────────────────────────────────────────────┘
 #
-# Injection-safe: the untrusted workflow_dispatch `version` input is bound to
-# env.VERSION and only ever referenced as the quoted "$VERSION"; it is never
-# interpolated directly into a run: line.
-name: publish
+# This is NOT the real monorepo publish.yml. It is a minimal stand-in for
+# `amit-kumar8-sf/mono-sbx` that reproduces ONLY the *emission contract* the
+# forcedotcom/b2c-dx side consumes, so the whole b2c-dx pipeline + S3 + the SLSA
+# attest→verify chain can be exercised end-to-end without a real build and with
+# ZERO npm/marketplace publishing.
+#
+# It MUST be committed at path `.github/workflows/publish.yml` because the b2c-dx
+# verifiers pin `--signer-workflow <repo>/.github/workflows/publish.yml`. Running it
+# from `main` (dispatch with --ref main) makes the attestation's source-ref
+# refs/heads/main, matching the consumers.
+#
+# What it emits per release_type:
+#   rc      -> GitHub release b2c-vs-extension@<changeset_version> (prerelease=TRUE)
+#              carrying TWO attested VSIX: odd-minor rc + even-minor stable.
+#   stable  -> GitHub release b2c-vs-extension@<changeset_version> (prerelease=FALSE)
+#              carrying ONE attested even-minor stable VSIX.
+#   nightly -> S3 upload of ONE attested odd-minor VSIX (…00) + .sha256 to nightly/.
+#   beta    -> S3 upload of ONE attested odd-minor VSIX (…NN) + .sha256 to beta/.
+#
+# The VSIX is a PLACEHOLDER (a tiny zip) — content correctness is out of scope; the
+# bytes only need to be stable so sha256 + provenance bind to the real file.
 
 on:
   workflow_dispatch:
     inputs:
-      version:
-        description: 'Version to release (tag becomes b2c-vs-extension@<version>)'
+      release_type:
+        description: 'Which channel to emit.'
         required: true
-        default: '0.10.1'
+        type: choice
+        options: [rc, stable, nightly, beta]
+      changeset_version:
+        description: 'Lane A only (rc/stable): the changeset semver = release tag X.Y.Z (e.g. 0.11.0).'
+        required: false
+        type: string
+      pre_version:
+        description: 'Odd-minor pre-release marketplace version. Blank = auto (nightly 1.1.<date>00, beta 1.1.<date>01, rc 1.1.<date>5).'
+        required: false
+        type: string
+      stable_version:
+        description: 'Lane A only: even-minor stable marketplace version (default 1.2.0).'
+        required: false
+        default: '1.2.0'
         type: string
 
 permissions:
   contents: read
 
 jobs:
-  build-attest-release:
+  emit:
+    name: Emit attested VSIX (${{ github.event.inputs.release_type }})
     runs-on: ubuntu-latest
     permissions:
-      contents: write # create the release + tag
-      id-token: write # required for SLSA provenance signing
-      attestations: write # required for actions/attest-build-provenance
+      contents: write   # create the GitHub release (Lane A)
+      id-token: write   # OIDC: SLSA attestation + assume the S3 write role (Lane B)
+      attestations: write # actions/attest-build-provenance
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      VERSION: ${{ github.event.inputs.version }}
+      RELEASE_TYPE: ${{ github.event.inputs.release_type }}
+      CHANGESET_VERSION: ${{ github.event.inputs.changeset_version }}
+      IN_PRE_VERSION: ${{ github.event.inputs.pre_version }}
+      STABLE_VERSION: ${{ github.event.inputs.stable_version || '1.2.0' }}
+      # S3 delivery config (Lane B). Same names/roles as prod; gated on presence.
+      VSIX_S3_ROLE_ARN: ${{ secrets.VSIX_S3_ROLE_ARN }}
+      VSIX_S3_BUCKET: ${{ secrets.VSIX_S3_BUCKET }}
+      VSIX_S3_REGION: ${{ vars.VSIX_S3_REGION || 'us-east-1' }}
+      VSIX_S3_PREFIX: ${{ vars.VSIX_S3_PREFIX }}
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-
-      - name: Build dummy VSIX + compute sha256
+      - name: Resolve versions and filenames
+        id: resolve
         run: |
           set -euo pipefail
-          # Constrain the untrusted version input before it touches a filename.
-          echo "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$' \
-            || { echo "::error::version '$VERSION' is not valid semver"; exit 1; }
-          mkdir -p packages/b2c-vs-extension
-          VSIX="packages/b2c-vs-extension/b2c-vs-extension-${VERSION}.vsix"
-          printf 'sandbox dummy VSIX for b2c-vs-extension %s (run %s)\n' "$VERSION" "$GITHUB_RUN_ID" > "$VSIX"
-          SHA=$(sha256sum "$VSIX" | awk '{print $1}')
-          echo "VSIX=$VSIX" >> "$GITHUB_ENV"
-          {
-            echo "### Producer output"
-            echo ""
-            echo "| field | value |"
-            echo "|---|---|"
-            echo "| version | \`$VERSION\` |"
-            echo "| vsix | \`$(basename "$VSIX")\` |"
-            echo "| sha256 | \`$SHA\` |"
-            echo "| tag | \`b2c-vs-extension@${VERSION}\` |"
-          } >> "$GITHUB_STEP_SUMMARY"
+          fail() { echo "::error::$1"; exit 1; }
+          DATE=$(date -u +%Y%m%d)
 
-      - name: Attest build provenance (SLSA)
+          case "$RELEASE_TYPE" in
+            nightly)
+              PRE_VER="${IN_PRE_VERSION:-1.1.${DATE}00}"
+              echo "channel=nightly" >> "$GITHUB_OUTPUT"
+              echo "pre_ver=$PRE_VER" >> "$GITHUB_OUTPUT"
+              ;;
+            beta)
+              PRE_VER="${IN_PRE_VERSION:-1.1.${DATE}01}"
+              echo "channel=beta" >> "$GITHUB_OUTPUT"
+              echo "pre_ver=$PRE_VER" >> "$GITHUB_OUTPUT"
+              ;;
+            rc)
+              [ -n "$CHANGESET_VERSION" ] || fail "rc requires changeset_version (X.Y.Z)"
+              PRE_VER="${IN_PRE_VERSION:-1.1.${DATE}5}"
+              echo "pre_ver=$PRE_VER" >> "$GITHUB_OUTPUT"
+              echo "stable_ver=$STABLE_VERSION" >> "$GITHUB_OUTPUT"
+              echo "tag=b2c-vs-extension@${CHANGESET_VERSION}" >> "$GITHUB_OUTPUT"
+              ;;
+            stable)
+              [ -n "$CHANGESET_VERSION" ] || fail "stable requires changeset_version (X.Y.Z)"
+              echo "stable_ver=$STABLE_VERSION" >> "$GITHUB_OUTPUT"
+              echo "tag=b2c-vs-extension@${CHANGESET_VERSION}" >> "$GITHUB_OUTPUT"
+              ;;
+            *) fail "unknown release_type '$RELEASE_TYPE'" ;;
+          esac
+
+      - name: Build placeholder VSIX file(s)
+        id: build
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/out /tmp/stage
+          # A .vsix is just a zip; content is irrelevant for the plumbing test, but
+          # the bytes must be deterministic per file so sha256/attestation are stable.
+          make_vsix() {
+            ver="$1"; out="/tmp/out/b2c-vs-extension-${ver}.vsix"
+            printf 'sandbox placeholder vsix for %s\n' "$ver" > /tmp/stage/extension.txt
+            (cd /tmp/stage && zip -q -X "$out" extension.txt)
+            echo "$out"
+          }
+          case "$RELEASE_TYPE" in
+            nightly|beta)
+              PRE_VER='${{ steps.resolve.outputs.pre_ver }}'
+              PRE_FILE=$(make_vsix "$PRE_VER")
+              echo "pre_file=$PRE_FILE" >> "$GITHUB_OUTPUT"
+              ;;
+            rc)
+              PRE_VER='${{ steps.resolve.outputs.pre_ver }}'
+              STABLE_VER='${{ steps.resolve.outputs.stable_ver }}'
+              echo "pre_file=$(make_vsix "$PRE_VER")" >> "$GITHUB_OUTPUT"
+              echo "stable_file=$(make_vsix "$STABLE_VER")" >> "$GITHUB_OUTPUT"
+              ;;
+            stable)
+              STABLE_VER='${{ steps.resolve.outputs.stable_ver }}'
+              echo "stable_file=$(make_vsix "$STABLE_VER")" >> "$GITHUB_OUTPUT"
+              ;;
+          esac
+          ls -l /tmp/out
+
+      # Real SLSA build provenance on the EXACT bytes. Binds to
+      # amit-kumar8-sf/mono-sbx/.github/workflows/publish.yml@refs/heads/main so the
+      # b2c-dx verifiers (which pin that signer-workflow) accept it.
+      - name: Attest VSIX provenance
         uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
         with:
-          subject-path: packages/b2c-vs-extension/*.vsix
+          subject-path: /tmp/out/*.vsix
 
-      - name: Create release
+      # ---- Lane A: GitHub release (rc/stable) --------------------------------
+      - name: Create GitHub release (Lane A)
+        if: github.event.inputs.release_type == 'rc' || github.event.inputs.release_type == 'stable'
+        env:
+          TAG: ${{ steps.resolve.outputs.tag }}
         run: |
           set -euo pipefail
-          TAG="b2c-vs-extension@${VERSION}"
-          # Re-runnable: replace any existing sandbox release/tag for this version.
-          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            gh release delete "$TAG" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag
-          fi
+          if [ "$RELEASE_TYPE" = "rc" ]; then PRERELEASE_FLAG="--prerelease"; else PRERELEASE_FLAG="--latest"; fi
+          # Create (or recreate) the release carrying every emitted VSIX.
+          gh release delete "$TAG" --repo "${{ github.repository }}" --yes --cleanup-tag 2>/dev/null || true
           gh release create "$TAG" \
-            --repo "$GITHUB_REPOSITORY" \
-            --title "b2c-vs-extension ${VERSION}" \
-            --notes "Sandbox test release for W-22108538 end-to-end verification." \
-            "$VSIX"
-          echo "Created release $TAG" >> "$GITHUB_STEP_SUMMARY"
+            --repo "${{ github.repository }}" \
+            --title "$TAG" \
+            --notes "Sandbox E2E emitter release ($RELEASE_TYPE). Placeholder VSIX, real SLSA provenance." \
+            $PRERELEASE_FLAG \
+            /tmp/out/*.vsix
+          names=""; for f in /tmp/out/*.vsix; do names="$names $(basename "$f")"; done
+          echo "::notice::created $TAG ($RELEASE_TYPE) with:$names"
+
+      # ---- Lane B: S3 upload (nightly/beta) ----------------------------------
+      - name: Configure AWS credentials (write role, via OIDC)
+        if: (github.event.inputs.release_type == 'nightly' || github.event.inputs.release_type == 'beta') && env.VSIX_S3_ROLE_ARN != ''
+        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4
+        with:
+          role-to-assume: ${{ secrets.VSIX_S3_ROLE_ARN }}
+          aws-region: ${{ vars.VSIX_S3_REGION || 'us-east-1' }}
+
+      - name: Upload pre-release VSIX + sha256 to S3 (Lane B)
+        if: (github.event.inputs.release_type == 'nightly' || github.event.inputs.release_type == 'beta') && env.VSIX_S3_ROLE_ARN != ''
+        env:
+          CHANNEL: ${{ steps.resolve.outputs.channel }}
+          PRE_FILE: ${{ steps.build.outputs.pre_file }}
+        run: |
+          set -euo pipefail
+          [ -n "$VSIX_S3_BUCKET" ] || { echo "::error::VSIX_S3_BUCKET unset"; exit 1; }
+          PREFIX="${VSIX_S3_PREFIX:+${VSIX_S3_PREFIX%/}/}"
+          BASE=$(basename "$PRE_FILE")
+          # Sidecar format MUST be "<sha>  <file>" (two spaces) — the consumer parses it.
+          ( cd "$(dirname "$PRE_FILE")" && sha256sum "$BASE" > "${BASE}.sha256" )
+          DEST="s3://${VSIX_S3_BUCKET}/${PREFIX}${CHANNEL}"
+          aws s3 cp "$PRE_FILE"          "${DEST}/${BASE}"
+          aws s3 cp "${PRE_FILE}.sha256" "${DEST}/${BASE}.sha256"
+          echo "::notice::uploaded ${BASE} (+ .sha256) to ${DEST}/"
